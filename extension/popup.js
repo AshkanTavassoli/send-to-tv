@@ -137,15 +137,35 @@ async function pausePage() {
   } catch { /* some pages block scripts; not important */ }
 }
 
+// Where the page's own player is (the main video = the longest one), so the
+// TV can continue from there. Returns seconds, or 0 to start from the top.
+async function pagePosition() {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: "MAIN",
+      func: () => [...document.querySelectorAll("video")]
+        .filter(v => isFinite(v.duration) && v.duration > 0)
+        .map(v => ({ t: v.currentTime, d: v.duration }))
+    });
+    const vids = results.flatMap(r => r.result || []);
+    if (!vids.length) return 0;
+    const main = vids.reduce((a, b) => (b.d > a.d ? b : a));
+    // Ignore the first few seconds, and don't resume right at the very end.
+    return main.t > 5 && main.d - main.t > 15 ? main.t : 0;
+  } catch { return 0; }
+}
+
 async function send(v) {
   say("Sending to the TV… (takes a few seconds)");
   try {
-    const sub = await chosenSubtitle();
-    const body = { url: v.url, headers: v.headers, title: tab.title };
+    const [sub, start] = await Promise.all([chosenSubtitle(), pagePosition()]);
+    const body = { url: v.url, headers: v.headers, title: tab.title, start };
     if (sub !== undefined) body.subtitle = sub;      // null = explicitly off
     const r = await helper("/cast", body);
     await pausePage();
-    say("Playing on the TV" + (r.subtitles ? " with subtitles."
+    const from = r.start > 0 ? ` from ${fmt(r.start)}` : "";
+    say("Playing on the TV" + from + (r.subtitles ? " with subtitles."
       : sub ? ". Subtitles failed: " + (r.warning || "unknown error") : "."), !r.subtitles && !!sub);
     poll();
   } catch (e) {
@@ -156,7 +176,7 @@ async function send(v) {
 async function tryPage() {
   say("Asking yt-dlp to find the video on this page…");
   try {
-    const body = { pageUrl: tab.url, title: tab.title };
+    const body = { pageUrl: tab.url, title: tab.title, start: await pagePosition() };
     const sub = await chosenSubtitle();
     if (sub) body.subtitle = sub;
     const r = await helper("/cast", body);

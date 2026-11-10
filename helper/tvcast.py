@@ -77,6 +77,16 @@ def is_http(url):
     return url.startswith("http://") or url.startswith("https://")
 
 
+# Videos with a known length are offered to the TV as one big "file" of
+# estimated size with byte-range support (DLNA.ORG_OP=01). That makes the TV's
+# own seek bar / remote arrows / fast-forward work: when it asks for "bytes
+# from N" we start the stream at the matching time. Live streams have no
+# length and are sent as a plain stream (OP=00, no seeking).
+DLNA_FLAGS = "DLNA.ORG_FLAGS=01700000000000000000000000000000"
+FEATURES_SEEK = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;" + DLNA_FLAGS
+FEATURES_LIVE = "DLNA.ORG_OP=00;DLNA.ORG_CI=1;" + DLNA_FLAGS
+TAIL_BYTES = 1_000_000  # TV reads the last bytes to learn the length
+
 RECONNECT = ["-reconnect", "1", "-reconnect_streamed", "1",
              "-reconnect_delay_max", "5", "-rw_timeout", "15000000"]
 
@@ -166,11 +176,14 @@ class TV:
             raise RuntimeError("this TV has no volume control over DLNA")
         return self._soap(self.rc_url, "RenderingControl", action, args)
 
-    def load(self, uri, title, sub_uri=None):
+    def load(self, uri, title, sub_uri=None, duration=None, size=None):
         # sec:CaptionInfo is Samsung's DLNA subtitle extension; others ignore it.
         sub = (f'<sec:CaptionInfoEx sec:type="srt">{escape(sub_uri)}</sec:CaptionInfoEx>'
                f'<sec:CaptionInfo sec:type="srt">{escape(sub_uri)}</sec:CaptionInfo>'
                if sub_uri else "")
+        dur = f' duration="{s_to_hms(duration)}"' if duration else ""
+        sz = f' size="{size}"' if size else ""
+        features = FEATURES_SEEK if size else FEATURES_LIVE
         didl = (
             '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
             'xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -179,7 +192,8 @@ class TV:
             '<item id="0" parentID="-1" restricted="1">'
             f'<dc:title>{escape(title)}</dc:title>'
             '<upnp:class>object.item.videoItem</upnp:class>'
-            f'<res protocolInfo="http-get:*:video/mp2t:*">{escape(uri)}</res>'
+            f'<res protocolInfo="http-get:*:video/mp2t:{features}"{dur}{sz}>'
+            f'{escape(uri)}</res>'
             f'{sub}</item></DIDL-Lite>'
         )
         try:
@@ -193,6 +207,9 @@ class TV:
 
     def play(self):
         self.avt("Play", "<Speed>1</Speed>")
+
+    def seek(self, seconds):
+        self.avt("Seek", f"<Unit>REL_TIME</Unit><Target>{s_to_hms(seconds)}</Target>")
 
     def pause(self):
         self.avt("Pause")
@@ -218,6 +235,19 @@ class TV:
         self.rc("SetVolume",
                 f"<Channel>Master</Channel><DesiredVolume>{v}</DesiredVolume>")
         return v
+
+
+def s_to_hms(sec):
+    sec = max(0.0, float(sec))
+    h, rem = divmod(sec, 3600)
+    m, s_ = divmod(rem, 60)
+    return f"{int(h)}:{int(m):02}:{s_:06.3f}"
+
+
+def parse_npt(header):
+    """'npt=600.5-' or 'npt=0:10:00.000-' -> 600.5 (TV clock seconds)."""
+    m = re.search(r"npt\s*=\s*([0-9:.]+)\s*-", header or "")
+    return hms_to_s(m.group(1)) if m else None
 
 
 def hms_to_s(t):
@@ -343,7 +373,15 @@ class Session:
         self.audio_url = audio_url
         self.headers = clean_headers(headers)
         self.title = title or "Video"
-        self.offset = 0.0
+        self.offset = 0.0         # media time that the TV's clock 0 corresponds to
+        self.requests = 0         # stream requests from the TV (for seek detection)
+        self.last_npt = None      # last TimeSeekRange start the TV asked for
+        self.timeseek = None      # None = unknown, True/False after first try
+        self.bandwidth = None     # bits/s, for estimating the "file" size
+        self.start_at = 0.0
+        self.procs = set()
+        self.tail = None          # cached last seconds (TV probes the end)
+        self.tail_lock = threading.Lock()
         self.duration = None
         self.vcodec = None
         self.proc = None
@@ -394,6 +432,10 @@ class Session:
         join = lambda u: urllib.parse.urljoin(base, u)
         self.url = join(best["URI"])
         log("HLS variant:", best.get("RESOLUTION"), best.get("BANDWIDTH"))
+        try:
+            self.bandwidth = int(best.get("BANDWIDTH") or 0) or None
+        except ValueError:
+            pass
 
         def rendition(kind, group):
             cands = [m for m in media if m.get("TYPE") == kind and m.get("URI")
@@ -429,21 +471,27 @@ class Session:
             self.duration = d if d > 0 else None
         except (TypeError, ValueError):
             self.duration = None
+        if not self.bandwidth:
+            try:
+                self.bandwidth = int(info.get("format", {}).get("bit_rate") or 0) or None
+            except ValueError:
+                pass
         vids = [s for s in info.get("streams", []) if s.get("codec_type") == "video"]
         if vids:
             self.vcodec = max(vids, key=lambda s: s.get("height") or 0).get("codec_name")
         log(f"probe: codec={self.vcodec} duration={self.duration}")
 
     # -- video -----------------------------------------------------------
-    def ffmpeg_cmd(self):
+    def ffmpeg_cmd(self, npt=0.0):
+        start = self.offset + npt
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin"]
 
         def add_input(url):
             nonlocal cmd
             if is_http(url):
                 cmd += RECONNECT + header_args(self.headers)
-            if self.offset > 0:
-                cmd += ["-ss", f"{self.offset:.2f}"]
+            if start > 0:
+                cmd += ["-ss", f"{start:.2f}"]
             cmd += ["-i", url]
 
         add_input(self.url)
@@ -458,20 +506,56 @@ class Session:
         else:  # VP9/AV1/etc: the 2018 TV can't take these in TS -> HW encode
             cmd += ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-maxrate", "12M",
                     "-bufsize", "16M", "-pix_fmt", "yuv420p"]
+        if npt > 0:  # timestamps continue from where the TV asked to start
+            cmd += ["-output_ts_offset", f"{npt:.3f}"]
         cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-f", "mpegts", "-mpegts_flags", "+resend_headers",
                 "-muxdelay", "0", "pipe:1"]
         return cmd
 
+    def tv_size(self):
+        """Pretend file size the TV sees (None for live streams)."""
+        d = tv_duration(self)
+        if not d:
+            return None
+        bps = self.bandwidth or 8_000_000
+        if self.vcodec not in (None, "h264", "hevc"):
+            bps = 10_000_000          # we re-encode at ~8 Mb/s
+        size = int(bps / 8 * d * 1.08)
+        return size - size % 188     # whole MPEG-TS packets
+
+    def tail_bytes(self):
+        """The last few seconds as MPEG-TS, cached: the TV reads the end of the
+        'file' several times to learn its length."""
+        with self.tail_lock:
+            if self.tail is None:
+                self._make_tail()
+        return self.tail
+
+    def _make_tail(self):
+        d = tv_duration(self)
+        cmd = self.ffmpeg_cmd(max(0.0, d - 6))
+        i = cmd.index("-f")
+        cmd[i:i] = ["-t", "6"]
+        try:
+            self.tail = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+        except Exception:
+            self.tail = b""
+        log(f"cached the last 6 s for the TV's length check ({len(self.tail)} bytes)")
+
     def kill(self):
         with self.lock:
-            p, self.proc = self.proc, None
-        if p and p.poll() is None:
-            p.kill()
-            try:
-                p.wait(3)
-            except Exception:
-                pass
+            procs, self.procs = self.procs, set()
+            if self.proc:
+                procs.add(self.proc)
+            self.proc = None
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                try:
+                    p.wait(3)
+                except Exception:
+                    pass
 
     # -- subtitles -------------------------------------------------------
     def set_subtitle(self, url, headers=None, text=None):
@@ -579,7 +663,7 @@ def resolve_page(page_url):
             audio, sub)
 
 
-def start_cast(url, headers, title, audio_url=None, subtitle=None):
+def start_cast(url, headers, title, audio_url=None, subtitle=None, start=0.0):
     old = current()
     if old:
         old.kill()
@@ -588,6 +672,12 @@ def start_cast(url, headers, title, audio_url=None, subtitle=None):
     STATE["session"] = s
     s.pick_hls_variant()
     s.probe()
+    want = float(start or 0)
+    if s.duration:
+        want = min(want, max(0.0, s.duration - 5))
+    else:
+        want = 0.0                # live stream: can't start in the middle
+    s.start_at = want if want > 5 else 0.0
     if not (subtitle and subtitle.get("url")) and s.hls_sub_url:
         subtitle = {"url": s.hls_sub_url, "headers": s.headers}
     if subtitle and (subtitle.get("url") or subtitle.get("text")):
@@ -597,10 +687,32 @@ def start_cast(url, headers, title, audio_url=None, subtitle=None):
         except Exception as e:
             log("subtitle error:", e)
             s.last_error = str(e)
+    if s.tv_size():  # prepare the end-of-file the TV will probe
+        threading.Thread(target=s.tail_bytes, daemon=True).start()
     stream, sub = urls_for(s, tv)
-    log("casting", s.title, "->", stream, "subs:", bool(sub))
-    tv.load(stream, s.title, sub)
+    log("casting", s.title, "->", stream, "subs:", bool(sub),
+        f"from {want:.0f}s" if want else "")
+    tv.load(stream, s.title, sub, tv_duration(s), s.tv_size())
+    if want > 5:
+        # Ask the TV to jump there (keeps the whole movie seekable on the
+        # remote). If it won't, restart the stream at that point instead.
+        deadline = time.time() + 12
+        while True:
+            try:
+                tv.seek(want)
+                break
+            except Exception as e:
+                if time.time() > deadline:
+                    log("TV wouldn't seek at start:", str(e)[:100])
+                    reload_at(want)
+                    break
+                time.sleep(0.7)
     return s
+
+
+def tv_duration(s):
+    """Length of the media as the TV sees it (its clock starts at s.offset)."""
+    return max(0.0, s.duration - s.offset) if s.duration else None
 
 
 def reload_at(offset):
@@ -612,9 +724,40 @@ def reload_at(offset):
     if s.duration:
         s.offset = min(s.offset, max(0.0, s.duration - 5))
     s.id = uuid.uuid4().hex[:10]
+    s.requests = 0
     tv = need_tv()
     stream, sub = urls_for(s, tv)
-    tv.load(stream, s.title, sub)
+    tv.load(stream, s.title, sub, tv_duration(s), s.tv_size())
+
+
+def seek_to(t):
+    """Jump to media time t. Prefer asking the TV to seek (DLNA time-seek: the
+    TV re-requests the stream from that point, and its own remote keeps
+    working); fall back to reloading the stream at t."""
+    s = current()
+    if not s:
+        raise RuntimeError("nothing is playing")
+    t = max(0.0, float(t))
+    if s.duration:
+        t = min(t, max(0.0, s.duration - 5))
+    tv_t = t - s.offset
+    if tv_t >= 0 and s.timeseek is not False:
+        before = s.requests
+        try:
+            need_tv().seek(tv_t)
+            deadline = time.time() + 4
+            while time.time() < deadline and s.requests == before:
+                time.sleep(0.1)
+            if s.requests > before:
+                s.timeseek = True
+                return "tv"
+            log("TV accepted Seek but didn't re-request the stream")
+        except Exception as e:
+            log("TV refused Seek:", getattr(e, "code", ""), str(e)[:120])
+        s.timeseek = False
+        log("time-seek not supported by this TV; using stream reload instead")
+    reload_at(t)
+    return "reload"
 
 
 def status():
@@ -680,20 +823,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _stream_headers(self, s):
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp2t")
-        self.send_header("transferMode.dlna.org", "Streaming")
-        self.send_header("contentFeatures.dlna.org",
-                         "DLNA.ORG_OP=00;DLNA.ORG_CI=1;"
-                         "DLNA.ORG_FLAGS=01700000000000000000000000000000")
-        if s.sub_srt is not None:
-            host = self.connection.getsockname()[0]
-            self.send_header("CaptionInfo.sec",
-                             f"http://{host}:{CONTROL_PORT}/sub/{s.id}.srt")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
     def _session_for(self, prefix, ext):
         s = current()
         if s and self.path.split("?")[0] == f"{prefix}{s.id}{ext}":
@@ -702,9 +831,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         s = self._session_for("/stream/", ".ts")
-        if s:
-            return self._stream_headers(s)
-        self.send_error(404)
+        if not s:
+            return self.send_error(404)
+        size = s.tv_size()
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org",
+                         FEATURES_SEEK if size else FEATURES_LIVE)
+        if size:
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(size))
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def do_GET(self):
         if self.path.startswith("/stream/"):
@@ -734,9 +873,49 @@ class Handler(BaseHTTPRequestHandler):
         s = self._session_for("/stream/", ".ts")
         if not s:
             return self.send_error(404)
-        s.kill()  # the TV re-requests on reconnect; only one pipe at a time
-        log("TV connected, starting ffmpeg at", f"{s.offset:.0f}s")
-        p = subprocess.Popen(s.ffmpeg_cmd(), stdout=subprocess.PIPE,
+        size = s.tv_size()
+        m = re.match(r"bytes=(\d+)-", self.headers.get("Range") or "")
+        first = int(m.group(1)) if (m and size) else 0
+        if size and first >= size:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        npt = parse_npt(self.headers.get("TimeSeekRange.dlna.org")) or 0.0
+        if size:
+            npt = first / size * tv_duration(s)
+        remaining = size - first if size else None
+        self.close_connection = True
+        self.send_response(206 if (m and size) else 200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org",
+                         FEATURES_SEEK if size else FEATURES_LIVE)
+        if size:
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(remaining))
+            if m:
+                self.send_header("Content-Range", f"bytes {first}-{size - 1}/{size}")
+        if s.sub_srt is not None:
+            host = self.connection.getsockname()[0]
+            self.send_header("CaptionInfo.sec",
+                             f"http://{host}:{CONTROL_PORT}/sub/{s.id}.srt")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if size and first > size - TAIL_BYTES:      # TV checking the length
+            tail = s.tail_bytes()
+            try:
+                self.wfile.write(tail[-remaining:] if remaining < len(tail) else tail)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        s.kill()  # a new position replaces the old stream
+        s.requests += 1
+        log("TV wants", f"{s.offset + npt:.0f}s" + (f" (byte {first})" if first else ""))
+        p = subprocess.Popen(s.ffmpeg_cmd(npt), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE)
         with s.lock:
             s.proc = p
@@ -746,14 +925,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         threading.Thread(target=self._drain_err, args=(s, p), daemon=True).start()
-        self.close_connection = True
-        self._stream_headers(s)
+        sent = 0
         try:
             while True:
                 chunk = p.stdout.read(64 * 1024)
                 if not chunk:
                     break
+                if remaining is not None and sent + len(chunk) > remaining:
+                    chunk = chunk[:remaining - sent]
                 self.wfile.write(chunk)
+                sent += len(chunk)
+                if remaining is not None and sent >= remaining:
+                    break
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -782,11 +965,13 @@ class Handler(BaseHTTPRequestHandler):
                 if data.get("pageUrl") and not data.get("url"):
                     url, headers, title, audio, sub = resolve_page(data["pageUrl"])
                     s = start_cast(url, headers, data.get("title") or title, audio,
-                                   data.get("subtitle") or sub)
+                                   data.get("subtitle") or sub, data.get("start") or 0)
                 else:
                     s = start_cast(data["url"], data.get("headers"), data.get("title"),
-                                   data.get("audioUrl"), data.get("subtitle"))
+                                   data.get("audioUrl"), data.get("subtitle"),
+                                   data.get("start") or 0)
                 return self._json(200, {"ok": True, "title": s.title,
+                                        "start": s.start_at,
                                         "duration": s.duration, "codec": s.vcodec,
                                         "subtitles": s.sub_srt is not None,
                                         "warning": s.last_error or None})
@@ -811,9 +996,10 @@ class Handler(BaseHTTPRequestHandler):
                     if s:
                         s.kill()
                 elif a == "seek":       # absolute seconds
-                    reload_at(float(v))
+                    return self._json(200, {"ok": True, "via": seek_to(float(v))})
                 elif a == "skip":       # relative seconds
-                    reload_at((s.offset + tv.position() if s else 0) + float(v))
+                    pos = (s.offset + tv.position()) if s else 0
+                    return self._json(200, {"ok": True, "via": seek_to(pos + float(v))})
                 elif a == "volume":
                     return self._json(200, {"ok": True, "volume": tv.set_volume(v)})
                 else:

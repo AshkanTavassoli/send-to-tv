@@ -30,7 +30,9 @@ Nothing is installed on the TV. No Developer Mode, no rooting.
 - Forwards the page's cookies, referer and user-agent, so streams that require them still play.
 - **Subtitles on the TV**: WebVTT/SRT/ASS from the page or inside the HLS stream, converted to SRT and drawn by the TV itself (Samsung's `CaptionInfo` DLNA extension). Captures subtitle text as the page downloads it, so single-use / locked subtitle links still work.
 - Separate audio tracks (HLS audio renditions, yt-dlp video+audio formats).
-- Controls: play/pause, ±10 s / ±30 s, seek bar, stop, TV volume, subtitle on/off/choice. Shortcuts: **⌥⇧P** play/pause, **⌥⇧→** +30 s, **⌥⇧←** −10 s.
+- **Seek with the TV remote**: the TV's own progress bar and arrow keys work. The helper offers the video to the TV as one big file of estimated size; when the TV asks for "bytes from N" it starts the stream at the matching time.
+- **Continues where you were**: if you've already watched part of the video in Chrome, the TV starts from that point.
+- Controls on the Mac: play/pause, ±10 s / ±30 s, seek bar, stop, TV volume, subtitle on/off/choice. Shortcuts: **⌥⇧P** play/pause, **⌥⇧→** +30 s, **⌥⇧←** −10 s.
 - Pauses the page's own player when the TV takes over.
 - Fallback: **"Try the page link instead"** hands the page URL to [yt-dlp](https://github.com/yt-dlp/yt-dlp) (YouTube and ~1,800 known sites).
 - Finds the TV automatically (SSDP) and remembers it; re-finds it if its IP changes.
@@ -93,7 +95,8 @@ Logs: `~/Library/Logs/SendToTV.log`. Remembered TV: `~/Library/Application Suppo
 ## Limits
 
 - **DRM-protected services (Netflix, Disney+, Prime Video, …) do not and will not work.** This tool does not bypass DRM; use the TV's own apps for those.
-- Seeking restarts the stream at the new position (2–4 s of black). Live streams can't be seeked.
+- Each jump takes the TV 2–4 seconds to resume. Live streams can't be seeked.
+- Use the remote's **arrows or progress bar** to jump, not **⏩ fast-forward**: fast-forward asks for a new position every second, faster than a web stream can restart, and the TV freezes (a jump with the arrows/progress bar or the popup unfreezes it).
 - Streams pass through the Mac, so it must stay on (it's kept awake automatically while streaming).
 - Sites that bind stream URLs to a single browser connection may not work.
 
