@@ -1,0 +1,44 @@
+name: TV compatibility report
+description: Tell us how Send to TV works on your TV (good or bad). This is the most useful thing you can contribute.
+labels: ["tv-report"]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: TV brand and model
+      placeholder: Samsung UN50NU7400
+    validations:
+      required: true
+  - type: input
+    id: year
+    attributes:
+      label: Year and software version (if you know them)
+      placeholder: 2018, Tizen 4.0
+  - type: dropdown
+    id: video
+    attributes:
+      label: Does video play?
+      options: ["Yes", "Yes, with problems", "No"]
+    validations:
+      required: true
+  - type: dropdown
+    id: subtitles
+    attributes:
+      label: Do subtitles show?
+      options: ["Yes", "No", "Not tried"]
+    validations:
+      required: true
+  - type: dropdown
+    id: seeking
+    attributes:
+      label: Does jumping with the TV remote (arrows / progress bar) work?
+      options: ["Yes", "No", "Not tried"]
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: >
+        What kind of stream it was (HLS, DASH, MP4), what went wrong, and the relevant lines
+        from ~/Library/Logs/SendToTV.log. Remove private addresses and tokens before pasting.

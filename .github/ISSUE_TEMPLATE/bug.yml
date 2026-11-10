@@ -1,0 +1,31 @@
+name: Bug report
+description: Something doesn't work as the README says it should.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the kind of page and stream (HLS, DASH, MP4). Please don't post links to private or paid content.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Send to TV version (chrome://extensions), macOS, Chrome, and your TV model.
+      placeholder: Send to TV 1.2.0, macOS 15.1, Chrome 131, Samsung UN50NU7400
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Helper log
+      description: The relevant lines from ~/Library/Logs/SendToTV.log. Remove private addresses and tokens first.
+      render: text

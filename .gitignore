@@ -2,6 +2,5 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
-*.ts
-*.srt
-*.vtt
+.ruff_cache/
+node_modules/

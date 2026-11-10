@@ -10,7 +10,8 @@ found automatically) is told to play it, so its own hardware player decodes.
 Subtitles are converted to SRT and handed to the TV through Samsung's
 CaptionInfo DLNA extension, so the TV draws them itself.
 
-Control API (localhost only):
+Control API (this Mac only, and only for the browser extension; see
+Handler._control_allowed):
   GET  /status
   POST /cast    {url, headers, title, audioUrl?, subtitle?: {url, headers, text?}}
                 or {pageUrl, title?}            (resolved with yt-dlp)
@@ -20,13 +21,14 @@ LAN (for the TV):
   GET /stream/<id>.ts      GET /sub/<id>.srt
 """
 
+__version__ = "1.2.0"
+
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -74,14 +76,36 @@ def header_args(headers):
 
 
 def is_http(url):
-    return url.startswith("http://") or url.startswith("https://")
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
+def require_http(url, what):
+    """Addresses from the control API go to ffmpeg / yt-dlp, which would also
+    accept local files and other protocols. Only web addresses are allowed."""
+    if not is_http(url):
+        raise ValueError(f"the {what} must be an http(s) address")
+    return url
+
+
+def check_subtitle(sub):
+    """Validate a subtitle description from the control API. When the text is
+    included, the address is only a label (it may be a blob: address)."""
+    if sub is None:
+        return None
+    if not isinstance(sub, dict):
+        raise ValueError("subtitle must be an object")
+    if sub.get("url") and not sub.get("text"):
+        require_http(sub["url"], "subtitle address")
+    return sub
 
 
 # Videos with a known length are offered to the TV as one big "file" of
 # estimated size with byte-range support (DLNA.ORG_OP=01). That makes the TV's
-# own seek bar / remote arrows / fast-forward work: when it asks for "bytes
-# from N" we start the stream at the matching time. Live streams have no
-# length and are sent as a plain stream (OP=00, no seeking).
+# own progress bar and remote arrows work: when it asks for "bytes from N" we
+# start the stream at the matching time. (Fast-forward "trick play" asks for
+# a new position about once a second, faster than a web stream can restart,
+# and is not supported.) Live streams have no length and are sent as a plain
+# stream (OP=00, no seeking).
 DLNA_FLAGS = "DLNA.ORG_FLAGS=01700000000000000000000000000000"
 FEATURES_SEEK = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;" + DLNA_FLAGS
 FEATURES_LIVE = "DLNA.ORG_OP=00;DLNA.ORG_CI=1;" + DLNA_FLAGS
@@ -364,6 +388,49 @@ def lan_ip_towards(ip):
         s.close()
 
 
+# -------------------------------------------------------------------------- HLS
+
+def _hls_attrs(line):
+    pairs = re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line)
+    return {k: (v or "").strip('"') for k, v in pairs}
+
+
+def parse_hls_master(text):
+    """(media renditions, variants) of an HLS master playlist, as attribute
+    dicts. Each variant also gets its playlist address under "URI"."""
+    media, variants, lines = [], [], text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-MEDIA:"):
+            media.append(_hls_attrs(line))
+        elif line.startswith("#EXT-X-STREAM-INF:"):
+            a = _hls_attrs(line)
+            uri = next((x.strip() for x in lines[i + 1:]
+                        if x.strip() and not x.startswith("#")), None)
+            if uri:
+                a["URI"] = uri
+                variants.append(a)
+    return media, variants
+
+
+def best_hls_variant(variants):
+    """Highest resolution, then bitrate, among codecs TVs can play directly
+    (VP9 / AV1 / Dolby Vision are only used when there is nothing else)."""
+    playable = [v for v in variants
+                if not re.search(r"vp09|av01|dvh1|dvhe", v.get("CODECS", ""))]
+    return max(playable or variants, key=lambda v: (
+        int((v.get("RESOLUTION", "0x0").split("x") + ["0"])[1] or 0),
+        int(v.get("BANDWIDTH", "0") or 0)))
+
+
+def rendition_rank(m):
+    """Sort key for audio / subtitle renditions: preferred language first."""
+    lang = (m.get("LANGUAGE") or "").lower()
+    return (lang in [x.lower() for x in SUB_LANGS] or
+            lang.split("-")[0] == SUB_LANGS[0].split("-")[0],
+            m.get("DEFAULT") == "YES",
+            m.get("FORCED") != "YES")
+
+
 # ---------------------------------------------------------------------- session
 
 class Session:
@@ -375,10 +442,8 @@ class Session:
         self.title = title or "Video"
         self.offset = 0.0         # media time that the TV's clock 0 corresponds to
         self.requests = 0         # stream requests from the TV (for seek detection)
-        self.last_npt = None      # last TimeSeekRange start the TV asked for
-        self.timeseek = None      # None = unknown, True/False after first try
+        self.tv_seek = None       # does the TV's own Seek work? None = untried
         self.bandwidth = None     # bits/s, for estimating the "file" size
-        self.start_at = 0.0
         self.procs = set()
         self.tail = None          # cached last seconds (TV probes the end)
         self.tail_lock = threading.Lock()
@@ -411,25 +476,12 @@ class Session:
             return
         if "#EXT-X-STREAM-INF" not in text:
             return
-        attr = lambda line: dict(re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line))
-        unq = lambda v: (v or "").strip('"')
-        media, variants, lines = [], [], text.splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-MEDIA:"):
-                media.append({k: unq(v) for k, v in attr(line).items()})
-            elif line.startswith("#EXT-X-STREAM-INF:"):
-                a = {k: unq(v) for k, v in attr(line).items()}
-                uri = next((l.strip() for l in lines[i + 1:]
-                            if l.strip() and not l.startswith("#")), None)
-                if uri:
-                    a["URI"] = uri
-                    variants.append(a)
-        codecs_ok = [v for v in variants
-                     if not re.search(r"vp09|av01|dvh1|dvhe", v.get("CODECS", ""))]
-        best = max(codecs_ok or variants, key=lambda v: (
-            int((v.get("RESOLUTION", "0x0").split("x") + ["0"])[1] or 0),
-            int(v.get("BANDWIDTH", "0") or 0)))
-        join = lambda u: urllib.parse.urljoin(base, u)
+        media, variants = parse_hls_master(text)
+        best = best_hls_variant(variants)
+
+        def join(u):
+            return urllib.parse.urljoin(base, u)
+
         self.url = join(best["URI"])
         log("HLS variant:", best.get("RESOLUTION"), best.get("BANDWIDTH"))
         try:
@@ -442,13 +494,7 @@ class Session:
                      and (not group or m.get("GROUP-ID") == group)]
             if not cands:
                 return None
-            def rank(m):
-                lang = (m.get("LANGUAGE") or "").lower()
-                return (lang in [l.lower() for l in SUB_LANGS] or
-                        lang.split("-")[0] == SUB_LANGS[0].split("-")[0],
-                        m.get("DEFAULT") == "YES",
-                        m.get("FORCED") != "YES")
-            return join(max(cands, key=rank)["URI"])
+            return join(max(cands, key=rendition_rank)["URI"])
 
         if best.get("AUDIO") and not self.audio_url:
             self.audio_url = rendition("AUDIO", best["AUDIO"])
@@ -485,6 +531,11 @@ class Session:
     def ffmpeg_cmd(self, npt=0.0):
         start = self.offset + npt
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin"]
+        if start > 0:
+            # Starting part-way: keep the source's own timestamps. Otherwise
+            # ffmpeg re-bases each input by itself after the jump, and a
+            # separate audio track ends up as much as one segment late.
+            cmd += ["-copyts", "-start_at_zero"]
 
         def add_input(url):
             nonlocal cmd
@@ -506,8 +557,10 @@ class Session:
         else:  # VP9/AV1/etc: the 2018 TV can't take these in TS -> HW encode
             cmd += ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-maxrate", "12M",
                     "-bufsize", "16M", "-pix_fmt", "yuv420p"]
-        if npt > 0:  # timestamps continue from where the TV asked to start
-            cmd += ["-output_ts_offset", f"{npt:.3f}"]
+        if start > 0 and self.offset > 0:
+            # The TV's clock starts at self.offset, not at the start of the media.
+            cmd += ["-output_ts_offset", f"{-self.offset:.3f}",
+                    "-avoid_negative_ts", "make_non_negative"]
         cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-f", "mpegts", "-mpegts_flags", "+resend_headers",
                 "-muxdelay", "0", "pipe:1"]
@@ -534,9 +587,7 @@ class Session:
 
     def _make_tail(self):
         d = tv_duration(self)
-        cmd = self.ffmpeg_cmd(max(0.0, d - 6))
-        i = cmd.index("-f")
-        cmd[i:i] = ["-t", "6"]
+        cmd = self.ffmpeg_cmd(max(0.0, d - 6))    # from there to the end
         try:
             self.tail = subprocess.run(cmd, capture_output=True, timeout=60).stdout
         except Exception:
@@ -598,7 +649,7 @@ class Session:
         out, n = [], 0
         for block in re.split(r"\r?\n\r?\n", self.sub_srt.strip()):
             lines = block.splitlines()
-            idx = next((i for i, l in enumerate(lines) if " --> " in l), None)
+            idx = next((i for i, x in enumerate(lines) if " --> " in x), None)
             if idx is None:
                 continue
             a, b = [srt_to_s(x) for x in lines[idx].split(" --> ")[:2]]
@@ -623,7 +674,13 @@ def s_to_srt(s):
     return f"{h:02}:{m:02}:{sec:02},{ms:03}"
 
 
-STATE = {"session": None}
+# "phase" is what a /cast request is doing right now, in words the popup
+# shows while it waits (None when no cast is being set up).
+STATE = {"session": None, "phase": None}
+
+
+def set_phase(text):
+    STATE["phase"] = text
 
 
 def current():
@@ -641,7 +698,7 @@ def resolve_page(page_url):
     """Use yt-dlp to find a playable stream (and subtitles) for a page URL."""
     fmt = ("b[vcodec^=avc1]/bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
            "bv*[vcodec^=avc1]+ba/b/bv*+ba")
-    out = subprocess.run([YTDLP, "-J", "--no-playlist", "-f", fmt, page_url],
+    out = subprocess.run([YTDLP, "-J", "--no-playlist", "-f", fmt, "--", page_url],
                          capture_output=True, text=True, timeout=90)
     if out.returncode != 0:
         msg = (out.stderr.strip().splitlines() or ["yt-dlp could not find a video"])[-1]
@@ -663,24 +720,21 @@ def resolve_page(page_url):
             audio, sub)
 
 
-def start_cast(url, headers, title, audio_url=None, subtitle=None, start=0.0):
+def start_cast(url, headers, title, audio_url=None, subtitle=None):
+    """Play from the beginning; the viewer jumps with the TV remote or popup."""
     old = current()
     if old:
         old.kill()
     tv = need_tv()
     s = Session(url, headers, title, audio_url)
     STATE["session"] = s
+    set_phase("Checking the stream")
     s.pick_hls_variant()
     s.probe()
-    want = float(start or 0)
-    if s.duration:
-        want = min(want, max(0.0, s.duration - 5))
-    else:
-        want = 0.0                # live stream: can't start in the middle
-    s.start_at = want if want > 5 else 0.0
     if not (subtitle and subtitle.get("url")) and s.hls_sub_url:
         subtitle = {"url": s.hls_sub_url, "headers": s.headers}
     if subtitle and (subtitle.get("url") or subtitle.get("text")):
+        set_phase("Preparing subtitles")
         try:
             s.set_subtitle(subtitle.get("url"), subtitle.get("headers"),
                            subtitle.get("text"))
@@ -689,24 +743,10 @@ def start_cast(url, headers, title, audio_url=None, subtitle=None, start=0.0):
             s.last_error = str(e)
     if s.tv_size():  # prepare the end-of-file the TV will probe
         threading.Thread(target=s.tail_bytes, daemon=True).start()
+    set_phase("Starting the TV's player")
     stream, sub = urls_for(s, tv)
-    log("casting", s.title, "->", stream, "subs:", bool(sub),
-        f"from {want:.0f}s" if want else "")
+    log("casting", s.title, "->", stream, "subs:", bool(sub))
     tv.load(stream, s.title, sub, tv_duration(s), s.tv_size())
-    if want > 5:
-        # Ask the TV to jump there (keeps the whole movie seekable on the
-        # remote). If it won't, restart the stream at that point instead.
-        deadline = time.time() + 12
-        while True:
-            try:
-                tv.seek(want)
-                break
-            except Exception as e:
-                if time.time() > deadline:
-                    log("TV wouldn't seek at start:", str(e)[:100])
-                    reload_at(want)
-                    break
-                time.sleep(0.7)
     return s
 
 
@@ -731,9 +771,9 @@ def reload_at(offset):
 
 
 def seek_to(t):
-    """Jump to media time t. Prefer asking the TV to seek (DLNA time-seek: the
-    TV re-requests the stream from that point, and its own remote keeps
-    working); fall back to reloading the stream at t."""
+    """Jump to media time t. Prefer asking the TV to seek (it re-requests the
+    stream from that point, and its own remote keeps working); fall back to
+    reloading the stream at t."""
     s = current()
     if not s:
         raise RuntimeError("nothing is playing")
@@ -741,7 +781,7 @@ def seek_to(t):
     if s.duration:
         t = min(t, max(0.0, s.duration - 5))
     tv_t = t - s.offset
-    if tv_t >= 0 and s.timeseek is not False:
+    if tv_t >= 0 and s.tv_seek is not False:
         before = s.requests
         try:
             need_tv().seek(tv_t)
@@ -749,20 +789,21 @@ def seek_to(t):
             while time.time() < deadline and s.requests == before:
                 time.sleep(0.1)
             if s.requests > before:
-                s.timeseek = True
+                s.tv_seek = True
                 return "tv"
             log("TV accepted Seek but didn't re-request the stream")
         except Exception as e:
             log("TV refused Seek:", getattr(e, "code", ""), str(e)[:120])
-        s.timeseek = False
-        log("time-seek not supported by this TV; using stream reload instead")
+        s.tv_seek = False
+        log("this TV doesn't seek by itself; reloading the stream instead")
     reload_at(t)
     return "reload"
 
 
 def status():
     s = current()
-    out = {"ok": True, "tv": None, "session": None}
+    out = {"ok": True, "version": __version__, "phase": STATE["phase"],
+           "tv": None, "session": None}
     tv = get_tv()
     if not tv:
         out["state"] = "NO_TV"
@@ -793,31 +834,59 @@ def status():
 
 # ------------------------------------------------------------------------- HTTP
 
+# Browser extensions that may use the control API. Web pages have http(s)
+# origins and are refused, so a site open in the browser can't drive the TV.
+ALLOWED_ORIGINS = ("chrome-extension://",)
+LOCAL_HOST_RE = re.compile(r"^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$", re.I)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "SendToTV/1.0"
+    server_version = "SendToTV/" + __version__
 
     def log_message(self, fmt, *args):
         pass
 
-    def _local_only(self):
-        if self.client_address[0] not in ("127.0.0.1", "::1"):
+    def _cors_origin(self):
+        """The Origin to allow in the reply: "" when the request has none
+        (not a browser page: curl, the installer), None when it is refused."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return ""
+        return origin if origin.startswith(ALLOWED_ORIGINS) else None
+
+    def _control_allowed(self):
+        """The control API is only for the extension on this Mac. The request
+        must come from this machine, be addressed to it by a local name
+        (stops DNS-rebinding pages), and not come from a web page."""
+        ok = (self.client_address[0] in ("127.0.0.1", "::1")
+              and LOCAL_HOST_RE.match(self.headers.get("Host") or "")
+              and self._cors_origin() is not None)
+        if not ok:
             self.send_error(403)
-            return False
-        return True
+        return bool(ok)
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if self._cors_origin():
+                self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+                self.send_header("Vary", "Origin")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the popup was closed before the answer was ready
 
     def do_OPTIONS(self):
+        if not self._control_allowed():
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self._cors_origin():
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", "0")
@@ -850,7 +919,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_stream()
         if self.path.startswith("/sub/"):
             return self.serve_sub()
-        if not self._local_only():
+        if not self._control_allowed():
             return
         if self.path == "/status":
             return self._json(200, status())
@@ -954,24 +1023,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n) or b"{}")
+        data = json.loads(self.rfile.read(n) or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return data
+
+    def _cast(self, data):
+        subtitle = check_subtitle(data.get("subtitle"))
+        try:
+            if data.get("pageUrl") and not data.get("url"):
+                set_phase("Finding the video on the page")
+                url, headers, title, audio, sub = resolve_page(
+                    require_http(data["pageUrl"], "page address"))
+                return start_cast(url, headers, data.get("title") or title, audio,
+                                  subtitle or sub)
+            if data.get("audioUrl"):
+                require_http(data["audioUrl"], "audio address")
+            return start_cast(require_http(data.get("url"), "video address"),
+                              data.get("headers"), data.get("title"),
+                              data.get("audioUrl"), subtitle)
+        finally:
+            set_phase(None)
 
     def do_POST(self):
-        if not self._local_only():
+        if not self._control_allowed():
             return
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return self._json(415, {"ok": False, "error": "send application/json"})
         try:
             data = self._body()
             if self.path == "/cast":
-                if data.get("pageUrl") and not data.get("url"):
-                    url, headers, title, audio, sub = resolve_page(data["pageUrl"])
-                    s = start_cast(url, headers, data.get("title") or title, audio,
-                                   data.get("subtitle") or sub, data.get("start") or 0)
-                else:
-                    s = start_cast(data["url"], data.get("headers"), data.get("title"),
-                                   data.get("audioUrl"), data.get("subtitle"),
-                                   data.get("start") or 0)
+                s = self._cast(data)
                 return self._json(200, {"ok": True, "title": s.title,
-                                        "start": s.start_at,
                                         "duration": s.duration, "codec": s.vcodec,
                                         "subtitles": s.sub_srt is not None,
                                         "warning": s.last_error or None})
@@ -979,6 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
                 s = current()
                 if not s:
                     raise RuntimeError("nothing is playing")
+                check_subtitle(data)
                 s.set_subtitle(data.get("url"), data.get("headers"), data.get("text"))
                 pos = s.offset + need_tv().position()
                 reload_at(pos)  # TV only reads subtitles when media is loaded
@@ -1006,6 +1091,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(400, {"ok": False, "error": f"bad action {a}"})
                 return self._json(200, {"ok": True})
             self._json(404, {"ok": False, "error": "not found"})
+        except ValueError as e:             # a request we won't act on
+            log("refused:", e)
+            self._json(400, {"ok": False, "error": str(e)})
         except Exception as e:
             log("error:", repr(e))
             self._json(500, {"ok": False, "error": str(e)})

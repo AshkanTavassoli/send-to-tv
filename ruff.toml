@@ -1,0 +1,6 @@
+# Lint settings for the helper (run: ruff check .)
+target-version = "py38"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "B"]

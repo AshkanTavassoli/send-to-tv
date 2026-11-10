@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Send to TV",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Finds the video a web page is playing and plays it on your TV (DLNA, e.g. Samsung) at full quality, with subtitles, via a small Mac helper.",
   "permissions": ["webRequest", "tabs", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],

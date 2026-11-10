@@ -4,6 +4,12 @@
 
 <p align="center"><em>Teach your old TV new tricks.</em></p>
 
+<p align="center">
+  <a href="https://github.com/AshkanTavassoli/send-to-tv/actions/workflows/ci.yml"><img src="https://github.com/AshkanTavassoli/send-to-tv/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%2B%20Chrome-lightgrey.svg" alt="Platform: macOS and Chrome">
+</p>
+
 **Play the video from any web page on your TV — at full quality, with subtitles — from Chrome on your Mac.**
 
 Smart-TV browsers (especially on older Samsung Tizen TVs) are slow and break on modern sites. Screen mirroring is choppy and low-res. *Send to TV* takes a different route:
@@ -14,6 +20,11 @@ Smart-TV browsers (especially on older Samsung Tizen TVs) are slow and break on 
 4. You control playback from the extension popup or keyboard shortcuts on the Mac.
 
 Nothing is installed on the TV. No Developer Mode, no rooting.
+
+<p align="center">
+  <img src="docs/popup-sending.png" width="330" alt="The popup while a video is being sent: a loading card showing the current step">
+  <img src="docs/popup-playing.png" width="330" alt="The popup while the TV is playing: position, play/pause, skip, volume and stop controls">
+</p>
 
 ```
  Chrome (Mac)                      Mac helper                        TV
@@ -31,8 +42,8 @@ Nothing is installed on the TV. No Developer Mode, no rooting.
 - **Subtitles on the TV**: WebVTT/SRT/ASS from the page or inside the HLS stream, converted to SRT and drawn by the TV itself (Samsung's `CaptionInfo` DLNA extension). Captures subtitle text as the page downloads it, so single-use / locked subtitle links still work.
 - Separate audio tracks (HLS audio renditions, yt-dlp video+audio formats).
 - **Seek with the TV remote**: the TV's own progress bar and arrow keys work. The helper offers the video to the TV as one big file of estimated size; when the TV asks for "bytes from N" it starts the stream at the matching time.
-- **Continues where you were**: if you've already watched part of the video in Chrome, the TV starts from that point.
 - Controls on the Mac: play/pause, ±10 s / ±30 s, seek bar, stop, TV volume, subtitle on/off/choice. Shortcuts: **⌥⇧P** play/pause, **⌥⇧→** +30 s, **⌥⇧←** −10 s.
+- Shows what is happening while a video is being sent (checking the stream, preparing subtitles, starting the TV), so you always know whether it worked.
 - Pauses the page's own player when the TV takes over.
 - Fallback: **"Try the page link instead"** hands the page URL to [yt-dlp](https://github.com/yt-dlp/yt-dlp) (YouTube and ~1,800 known sites).
 - Finds the TV automatically (SSDP) and remembers it; re-finds it if its IP changes.
@@ -100,6 +111,15 @@ Logs: `~/Library/Logs/SendToTV.log`. Remembered TV: `~/Library/Application Suppo
 - Streams pass through the Mac, so it must stay on (it's kept awake automatically while streaming).
 - Sites that bind stream URLs to a single browser connection may not work.
 
+## Privacy and security
+
+- **Nothing is sent to us or to any third party.** There is no account, no analytics and no server of ours. The extension talks only to the helper on your own Mac (`127.0.0.1`); the helper talks only to the video's own server and to your TV.
+- **Why the extension can see every site:** it has to notice video and subtitle requests on whatever page you happen to be watching, and read the headers (cookies, referer) that request used so the helper can fetch the same stream. That information stays in memory for the browser session and is never written to disk.
+- **The helper accepts commands only from the extension on the same Mac.** Requests from web pages are refused, and only `http(s)` addresses can be cast.
+- The stream is offered to the TV on your local network while it plays, at an address with a random id. Use it on networks you trust.
+
+Details and how to report a problem: [SECURITY.md](SECURITY.md).
+
 ## Uninstall
 
 ```bash
@@ -110,8 +130,18 @@ Then remove the extension in `chrome://extensions`.
 
 ## How it works (details)
 
-- **Extension** (`extension/`): `background.js` watches network requests (`chrome.webRequest`, with `extraHeaders` to see cookies) and classifies them as HLS/DASH/file/subtitle; `hook.js` runs in the page and keeps a copy of subtitle files the page downloads; `popup.js` is the UI.
+- **Extension** (`extension/`, Manifest V3, no build step): `background.js` watches network requests (`chrome.webRequest`, with `extraHeaders` to see cookies) and classifies them as HLS/DASH/file/subtitle; `hook.js` runs in the page and keeps a copy of subtitle files the page downloads; `popup.js` is the UI.
 - **Helper** (`helper/tvcast.py`, Python standard library only): picks the best HLS variant (and its audio/subtitle renditions), runs `ffmpeg -c copy` into MPEG-TS over HTTP, and drives the TV with UPnP `AVTransport` / `RenderingControl` SOAP calls. Subtitles are served as SRT and announced to the TV with `sec:CaptionInfoEx` in the DIDL metadata and a `CaptionInfo.sec` response header.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v   # helper tests
+node --test tests/                         # extension tests
+ruff check .                               # lint
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project layout and guidelines, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Please use responsibly
 

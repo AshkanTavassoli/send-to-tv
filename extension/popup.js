@@ -1,9 +1,14 @@
 const HELPER = "http://127.0.0.1:8770";
 const $ = id => document.getElementById(id);
+
 let tab = null;
-let found = [];
-let lastStatus = null;
-let seeking = false;
+let found = [];          // streams and subtitle files seen on this tab
+let lastStatus = null;   // last /status answer from the helper
+let sendingStep = null;  // what this popup is doing while a video is being sent
+let acting = null;       // short label while a control (seek, stop…) is in flight
+let expectUntil = 0;     // just sent a video: keep the player card up until it starts
+let seeking = false;     // the user is dragging the position slider
+let toastTimer = null;
 
 async function helper(path, body) {
   const r = await fetch(HELPER + path, body ? {
@@ -15,11 +20,20 @@ async function helper(path, body) {
   return j;
 }
 
-function say(text, bad) {
+// A short result message under everything else. Good news fades by itself.
+function toast(text, kind) {
   const m = $("msg");
+  clearTimeout(toastTimer);
   m.hidden = !text;
   m.textContent = text || "";
-  m.className = "msg" + (bad ? " bad" : "");
+  m.className = "toast" + (kind ? " " + kind : "");
+  if (text && kind !== "bad") toastTimer = setTimeout(() => { m.hidden = true; }, 6000);
+}
+
+// A standing problem (no helper, no TV). Cleared when the problem goes away.
+function banner(text) {
+  $("banner").hidden = !text;
+  $("banner").textContent = text || "";
 }
 
 function fmt(s) {
@@ -33,7 +47,15 @@ function shortUrl(u) {
   try { const x = new URL(u); return x.host + x.pathname; } catch { return u; }
 }
 
+function fileName(u) {
+  const name = u.split(/[?#]/)[0].split("/").pop() || u;
+  try { return decodeURIComponent(name); } catch { return name; }
+}
+
 // ---------------------------------------------------------------- list
+
+const KIND_LABEL = { hls: "Stream", dash: "Stream", file: "Video file" };
+const KIND_NOTE = { hls: "HLS", dash: "DASH", file: "" };
 
 function rank(i) {
   // Prefer master playlists, then other playlists, then plain files.
@@ -43,32 +65,44 @@ function rank(i) {
   return r;
 }
 
+function itemRow(v, best) {
+  const row = document.createElement("div");
+  row.className = "item" + (best ? " best" : "");
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const kind = document.createElement("div");
+  kind.className = "kind";
+  kind.append(KIND_LABEL[v.kind] + (KIND_NOTE[v.kind] ? " · " + KIND_NOTE[v.kind] : ""));
+  if (best) {
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = "Best match";
+    kind.append(badge);
+  }
+  const url = document.createElement("div");
+  url.className = "url";
+  url.textContent = shortUrl(v.url);
+  url.title = v.url;
+  meta.append(kind, url);
+  const btn = document.createElement("button");
+  btn.className = best ? "primary" : "";
+  btn.textContent = best ? "Send to TV" : "Send";
+  btn.onclick = () => send(v);
+  row.append(meta, btn);
+  return row;
+}
+
 function renderList() {
   const vids = found.filter(i => i.kind !== "sub").sort((a, b) => rank(a) - rank(b) || a.seen - b.seen);
-  const list = $("list");
-  list.textContent = "";
+  $("list").textContent = "";
+  $("moreList").textContent = "";
   $("empty").hidden = vids.length > 0;
-  vids.forEach((v, n) => {
-    const row = document.createElement("div");
-    row.className = "item";
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const kind = document.createElement("div");
-    kind.className = "kind";
-    kind.textContent = ({ hls: "Stream (HLS)", dash: "Stream (DASH)", file: "Video file" })[v.kind]
-      + (n === 0 ? " · best guess" : "");
-    const url = document.createElement("div");
-    url.className = "url";
-    url.textContent = shortUrl(v.url);
-    url.title = v.url;
-    meta.append(kind, url);
-    const btn = document.createElement("button");
-    btn.className = n === 0 ? "primary" : "";
-    btn.textContent = "Send to TV";
-    btn.onclick = () => send(v);
-    row.append(meta, btn);
-    list.append(row);
-  });
+  if (vids.length) $("list").append(itemRow(vids[0], true));
+  const others = vids.slice(1);
+  others.forEach(v => $("moreList").append(itemRow(v, false)));
+  $("more").hidden = others.length === 0;
+  $("moreSummary").textContent = others.length === 1
+    ? "1 other stream on this page" : `${others.length} other streams on this page`;
 
   const subs = found.filter(i => i.kind === "sub");
   const sel = $("subs");
@@ -77,11 +111,18 @@ function renderList() {
   subs.forEach(s => {
     const o = document.createElement("option");
     o.value = s.url;
-    o.textContent = "File: " + decodeURIComponent(s.url.split("?")[0].split("/").pop());
+    o.textContent = fileName(s.url);
     sel.append(o);
   });
   if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
 }
+
+async function refreshFound() {
+  const r = await chrome.runtime.sendMessage({ type: "list", tabId: tab.id });
+  return (r && r.items) || [];
+}
+
+// ---------------------------------------------------------------- subtitles
 
 // Re-download a subtitle file from inside the page (same cookies, origin and
 // referer as the page's own player). Tries every frame; first success wins.
@@ -111,11 +152,11 @@ async function withText(s) {
   return s.text ? { url: s.url, text: s.text } : { url: s.url, headers: s.headers };
 }
 
+// undefined = let the helper look inside the stream, null = off.
 async function chosenSubtitle() {
   const v = $("subs").value;
   // Re-read the list: subtitle text may have arrived since the popup opened.
-  const r = await chrome.runtime.sendMessage({ type: "list", tabId: tab.id });
-  found = r.items || found;
+  found = await refreshFound().catch(() => found);
   if (v === "auto") {
     // A subtitle file the page loaded (the helper also finds subtitle tracks
     // inside HLS streams by itself). Prefer one we already have the text of.
@@ -128,6 +169,8 @@ async function chosenSubtitle() {
   return await withText(s);
 }
 
+// ---------------------------------------------------------------- the page's player
+
 async function pausePage() {
   try {
     await chrome.scripting.executeScript({
@@ -137,117 +180,144 @@ async function pausePage() {
   } catch { /* some pages block scripts; not important */ }
 }
 
-// Where the page's own player is (the main video = the longest one), so the
-// TV can continue from there. Returns seconds, or 0 to start from the top.
-async function pagePosition() {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      world: "MAIN",
-      func: () => [...document.querySelectorAll("video")]
-        .filter(v => isFinite(v.duration) && v.duration > 0)
-        .map(v => ({ t: v.currentTime, d: v.duration }))
-    });
-    const vids = results.flatMap(r => r.result || []);
-    if (!vids.length) return 0;
-    const main = vids.reduce((a, b) => (b.d > a.d ? b : a));
-    // Ignore the first few seconds, and don't resume right at the very end.
-    return main.t > 5 && main.d - main.t > 15 ? main.t : 0;
-  } catch { return 0; }
-}
+// ---------------------------------------------------------------- sending
 
-async function send(v) {
-  say("Sending to the TV… (takes a few seconds)");
+// Runs one "send a video" job with the loading card up from the first click
+// until the helper answers. `job` returns the helper's /cast answer.
+async function sendJob(firstStep, failPrefix, job) {
+  if (sendingStep) return;
+  sendingStep = firstStep;
+  toast("");
+  render();
   try {
-    const [sub, start] = await Promise.all([chosenSubtitle(), pagePosition()]);
-    const body = { url: v.url, headers: v.headers, title: tab.title, start };
-    if (sub !== undefined) body.subtitle = sub;      // null = explicitly off
-    const r = await helper("/cast", body);
+    const r = await job(step => { sendingStep = step; render(); });
     await pausePage();
-    const from = r.start > 0 ? ` from ${fmt(r.start)}` : "";
-    say("Playing on the TV" + from + (r.subtitles ? " with subtitles."
-      : sub ? ". Subtitles failed: " + (r.warning || "unknown error") : "."), !r.subtitles && !!sub);
-    poll();
+    expectUntil = Date.now() + 12000;
+    if (r.wantedSubs && !r.subtitles) {
+      toast(`Playing on the TV, but without subtitles: ${r.warning || "they could not be read"}.`, "bad");
+    } else {
+      toast(`Playing on the TV${r.subtitles ? ", with subtitles" : ""}.`, "good");
+    }
   } catch (e) {
-    say("Couldn't send: " + e.message, true);
+    toast(failPrefix + e.message, "bad");
+  } finally {
+    sendingStep = null;
+    await poll();
   }
 }
 
-async function tryPage() {
-  say("Asking yt-dlp to find the video on this page…");
-  try {
-    const body = { pageUrl: tab.url, title: tab.title, start: await pagePosition() };
+function send(v) {
+  return sendJob("Reading the page…", "Couldn't send it: ", async step => {
     const sub = await chosenSubtitle();
-    if (sub) body.subtitle = sub;
+    const body = { url: v.url, headers: v.headers, title: tab.title };
+    if (sub !== undefined) body.subtitle = sub;      // null = explicitly off
+    step("Contacting the TV…");
     const r = await helper("/cast", body);
-    await pausePage();
-    say("Playing on the TV" + (r.subtitles ? " with subtitles." : "."));
-    poll();
-  } catch (e) {
-    say("yt-dlp couldn't use this page: " + e.message, true);
-  }
+    return { ...r, wantedSubs: !!sub };
+  });
 }
 
-// ---------------------------------------------------------------- now playing
+function tryPage() {
+  return sendJob("Reading the page…", "The page link didn't work: ", async step => {
+    const sub = await chosenSubtitle();
+    const body = { pageUrl: tab.url, title: tab.title };
+    if (sub) body.subtitle = sub;
+    step("Finding the video on the page…");
+    const r = await helper("/cast", body);
+    return { ...r, wantedSubs: !!sub };
+  });
+}
 
-async function poll() {
-  let s;
-  try {
-    s = await helper("/status");
-  } catch {
-    $("conn").textContent = "Helper not set up";
-    $("conn").className = "pill bad";
-    say("The Mac helper didn't answer. Run ./install.sh in the send-to-tv folder (see README).", true);
-    return;
-  }
-  lastStatus = s;
-  const reachable = s.state !== "UNREACHABLE" && s.state !== "NO_TV";
-  $("conn").textContent = reachable ? (s.tv && s.tv.name ? s.tv.name : "TV connected")
-    : s.state === "NO_TV" ? "No TV found" : "TV not reachable";
-  $("conn").title = s.tv ? `${s.tv.name} · ${s.tv.model} · ${s.tv.ip}` : "";
-  $("conn").className = "pill " + (reachable ? "ok" : "bad");
-  if (!reachable) {
-    say(/route to host/i.test(s.tvError || "")
-      ? "macOS is blocking the helper from the network: System Settings → Privacy & Security → Local Network → turn on Python."
-      : "Can't find the TV. Is it on and on the same Wi-Fi as this Mac?", true);
-  }
-  const sess = s.session;
-  const active = sess && ["PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"].includes(s.state);
+// ---------------------------------------------------------------- display
+
+const ACTIVE_STATES = ["PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"];
+
+function render() {
+  const s = lastStatus;
+  // The helper reports what a cast is doing even if another popup started it.
+  const step = (s && s.phase ? s.phase + "…" : null) || sendingStep;
+  document.body.classList.toggle("is-busy", !!step);
+  $("busy").hidden = !step;
+  if (step) $("busyStep").textContent = step;
+
+  const sess = s && s.session;
+  const active = !step && sess &&
+    (ACTIVE_STATES.includes(s.state) || Date.now() < expectUntil);
   $("now").hidden = !active;
   if (!active) return;
+
+  const playing = s.state === "PLAYING", paused = s.state === "PAUSED_PLAYBACK";
+  if (playing || paused) expectUntil = 0;
+  $("now").classList.toggle("paused", paused && !acting);
+  $("now").classList.toggle("waiting", !!acting || !(playing || paused));
+  $("nowState").textContent = acting || (playing ? "Playing on the TV" : paused ? "Paused" : "Starting…");
   $("nowTitle").textContent = sess.title;
-  $("pos").textContent = fmt(sess.position);
-  $("dur").textContent = sess.duration ? fmt(sess.duration) : "live";
+  $("nowTitle").title = sess.title;
+  if (!seeking) $("pos").textContent = fmt(sess.position);
+  $("dur").textContent = sess.duration ? fmt(sess.duration) : "Live";
   if (!seeking && sess.duration) {
     $("seek").max = Math.floor(sess.duration);
     $("seek").value = Math.floor(sess.position || 0);
   }
   $("seek").disabled = !sess.duration;
-  $("playpause").textContent = s.state === "PLAYING" ? "❚❚" : "▶";
+  for (const id of ["back30", "back10", "fwd10", "fwd30"]) $(id).disabled = !sess.duration;
   if (s.volume != null && document.activeElement !== $("volume")) {
     $("volume").value = s.volume;
     $("volNum").textContent = s.volume;
   }
   $("nowSubs").textContent = sess.subtitles
-    ? "Subtitles sent. If you don't see them, press Tools/Subtitle on the TV remote and turn them on."
+    ? "Subtitles are on. Not showing? Turn them on with the remote's Subtitle setting."
     : "";
 }
 
-async function control(action, value) {
-  try { await helper("/control", { action, value }); } catch (e) { say(e.message, true); }
-  setTimeout(poll, 700);
+function renderConnection(s) {
+  const reachable = s.state !== "UNREACHABLE" && s.state !== "NO_TV";
+  $("connText").textContent = reachable ? (s.tv && s.tv.name ? s.tv.name : "TV connected")
+    : s.state === "NO_TV" ? "No TV found" : "TV not reachable";
+  $("conn").title = s.tv ? [s.tv.name, s.tv.model, s.tv.ip].filter(Boolean).join(" · ") : "";
+  $("conn").className = "chip " + (reachable ? "ok" : "bad");
+  banner(reachable ? "" : /route to host/i.test(s.tvError || "")
+    ? "macOS is blocking the helper from your network. Open System Settings → Privacy & Security → Local Network and turn on Python."
+    : "Can't find the TV. Check that it is on and on the same Wi-Fi as this Mac.");
+}
+
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    lastStatus = await helper("/status");
+    renderConnection(lastStatus);
+  } catch {
+    lastStatus = null;
+    $("connText").textContent = "Helper not running";
+    $("conn").className = "chip bad";
+    banner("The Mac helper didn't answer. Run ./install.sh in the send-to-tv folder (see the README).");
+  } finally {
+    polling = false;
+  }
+  render();
+}
+
+async function control(action, value, label) {
+  acting = label || null;
+  render();
+  try { await helper("/control", { action, value }); }
+  catch (e) { toast(e.message, "bad"); }
+  acting = null;
+  await poll();
 }
 
 // ---------------------------------------------------------------- wiring
 
 $("playpause").onclick = () => control(lastStatus && lastStatus.state === "PLAYING" ? "pause" : "play");
-$("back30").onclick = () => control("skip", -30);
-$("back10").onclick = () => control("skip", -10);
-$("fwd10").onclick = () => control("skip", 10);
-$("fwd30").onclick = () => control("skip", 30);
-$("stop").onclick = () => control("stop");
+$("back30").onclick = () => control("skip", -30, "Jumping…");
+$("back10").onclick = () => control("skip", -10, "Jumping…");
+$("fwd10").onclick = () => control("skip", 10, "Jumping…");
+$("fwd30").onclick = () => control("skip", 30, "Jumping…");
+$("stop").onclick = () => control("stop", undefined, "Stopping…");
 $("seek").oninput = () => { seeking = true; $("pos").textContent = fmt(+$("seek").value); };
-$("seek").onchange = async () => { await control("seek", +$("seek").value); seeking = false; };
+$("seek").onchange = async () => { await control("seek", +$("seek").value, "Jumping…"); seeking = false; };
 $("volume").oninput = () => { $("volNum").textContent = $("volume").value; };
 $("volume").onchange = () => control("volume", +$("volume").value);
 $("tryPage").onclick = tryPage;
@@ -257,24 +327,30 @@ $("refresh").onclick = async () => {
   window.close();
 };
 $("subs").onchange = async () => {
-  if (!lastStatus || !lastStatus.session) return;
+  if (!lastStatus || !lastStatus.session) return;   // nothing on the TV: applies to the next send
+  acting = "Updating subtitles…";
+  render();
   try {
     const sub = await chosenSubtitle();
-    say("Updating subtitles on the TV…");
     await helper("/subtitle", sub ? sub : { url: null });
-    say(sub ? "Subtitles updated." : "Subtitles off.");
-  } catch (e) { say(e.message, true); }
+    toast(sub ? "Subtitles updated." : "Subtitles off.", "good");
+  } catch (e) { toast(e.message, "bad"); }
+  acting = null;
+  await poll();
 };
 
 (async () => {
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const r = await chrome.runtime.sendMessage({ type: "list", tabId: tab.id });
-  found = r.items || [];
+  found = await refreshFound();
   renderList();
-  await poll();
-  setInterval(poll, 1500);
+  // Check the helper often while something is being sent, otherwise calmly.
+  const loop = async () => {
+    await poll();
+    setTimeout(loop, document.body.classList.contains("is-busy") ? 500 : 1500);
+  };
+  loop();
   setInterval(async () => {
-    const r = await chrome.runtime.sendMessage({ type: "list", tabId: tab.id });
-    if ((r.items || []).length !== found.length) { found = r.items; renderList(); }
+    const items = await refreshFound().catch(() => null);
+    if (items && items.length !== found.length) { found = items; renderList(); }
   }, 2000);
 })();

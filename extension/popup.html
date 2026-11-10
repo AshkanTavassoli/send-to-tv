@@ -1,56 +1,95 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<title>Send to TV</title>
 <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <header>
+    <img class="logo" src="icon48.png" alt="">
     <h1>Send to TV</h1>
-    <span id="conn" class="pill">…</span>
+    <span id="conn" class="chip" title=""><i class="dot"></i><span id="connText">Connecting…</span></span>
   </header>
 
-  <section id="now" hidden>
-    <div class="label">On the TV</div>
+  <!-- A problem that needs the user's attention (helper missing, no TV). -->
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <!-- A video is being sent: shown until the TV starts playing. -->
+  <section id="busy" class="card busy" aria-live="polite" hidden>
+    <div class="busy-row">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="busy-text">
+        <div class="eyebrow">Sending to the TV</div>
+        <div id="busyStep" class="title">Getting ready…</div>
+      </div>
+    </div>
+    <div class="track" aria-hidden="true"><i></i></div>
+    <div class="hint">This usually takes 5–15 seconds.</div>
+  </section>
+
+  <!-- Something is on the TV. -->
+  <section id="now" class="card now" hidden>
+    <div class="eyebrow"><i class="dot"></i><span id="nowState">Playing</span></div>
     <div id="nowTitle" class="title"></div>
     <div class="progress">
       <span id="pos">0:00</span>
-      <input id="seek" type="range" min="0" max="100" value="0" step="1">
+      <input id="seek" type="range" min="0" max="100" value="0" step="1" aria-label="Position">
       <span id="dur">--:--</span>
     </div>
-    <div class="controls">
-      <button id="back30" title="Back 30s">−30</button>
-      <button id="back10" title="Back 10s">−10</button>
-      <button id="playpause" class="primary" title="Play / pause">⏯</button>
-      <button id="fwd10" title="Forward 10s">+10</button>
-      <button id="fwd30" title="Forward 30s">+30</button>
-      <button id="stop" title="Stop">■</button>
+    <div class="transport">
+      <button id="back30" class="skip" title="Back 30 seconds">−30</button>
+      <button id="back10" class="skip" title="Back 10 seconds">−10</button>
+      <button id="playpause" class="play" title="Play / pause" aria-label="Play or pause">
+        <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+        <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 8 5.5z"/></svg>
+      </button>
+      <button id="fwd10" class="skip" title="Forward 10 seconds">+10</button>
+      <button id="fwd30" class="skip" title="Forward 30 seconds">+30</button>
     </div>
-    <div class="vol">
-      <span>🔈</span><input id="volume" type="range" min="0" max="100" value="10"><span id="volNum"></span>
+    <div class="bottom">
+      <svg class="vol-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5v5a1 1 0 0 0 1 1h3l4.3 3.6a1 1 0 0 0 1.7-.8V5.7a1 1 0 0 0-1.7-.8L8 8.5H5a1 1 0 0 0-1 1z"/><path class="wave" d="M17 8.5a5 5 0 0 1 0 7"/></svg>
+      <input id="volume" type="range" min="0" max="100" value="10" aria-label="TV volume">
+      <span id="volNum" class="num"></span>
+      <button id="stop" class="ghost" title="Stop playing on the TV">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Stop
+      </button>
     </div>
     <div id="nowSubs" class="hint"></div>
   </section>
 
-  <section>
-    <div class="label">Videos found on this page</div>
-    <div id="list"></div>
-    <div id="empty" class="hint" hidden>
-      Nothing detected yet. Press play on the video in the page, then reopen this.
+  <section id="page">
+    <div class="head">
+      <h2>On this page</h2>
+      <button id="refresh" class="link" title="Clear the list and reload the page to detect again">Reload &amp; detect</button>
     </div>
+
+    <div id="list"></div>
+    <details id="more" hidden>
+      <summary id="moreSummary"></summary>
+      <div id="moreList"></div>
+    </details>
+
+    <div id="empty" class="empty" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect class="outline" x="3" y="5" width="18" height="12" rx="2.5"/><path class="outline" d="M8.5 20h7"/><path d="M10.5 9v4l3.5-2z"/></svg>
+      <div class="title">No video found yet</div>
+      <div class="hint">Press play on the video in the page, then open this again.</div>
+    </div>
+
+    <label class="field">
+      <span>Subtitles</span>
+      <select id="subs">
+        <option value="auto">Automatic</option>
+        <option value="">Off</option>
+      </select>
+    </label>
+
+    <button id="tryPage" class="link wide" title="Let yt-dlp look at the page address instead">
+      Not working? Try the page link instead
+    </button>
   </section>
 
-  <section>
-    <div class="label">Subtitles</div>
-    <select id="subs"><option value="auto">Automatic (from the stream)</option><option value="">Off</option></select>
-  </section>
-
-  <section class="row">
-    <button id="tryPage" title="Let yt-dlp look at the page address">Try the page link instead</button>
-    <button id="refresh" title="Clear and reload the page to detect again">Reload &amp; detect</button>
-  </section>
-
-  <div id="msg" class="msg" hidden></div>
+  <div id="msg" class="toast" role="status" hidden></div>
   <script src="popup.js"></script>
 </body>
 </html>

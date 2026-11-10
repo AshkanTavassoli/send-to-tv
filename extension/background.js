@@ -63,7 +63,7 @@ function updateBadge(tabId) {
   const t = tabs.get(tabId);
   const n = t ? t.items.filter(i => i.kind !== "sub").length : 0;
   chrome.action.setBadgeText({ tabId, text: n ? String(n) : "" }).catch(() => {});
-  chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#c2410c" }).catch(() => {});
 }
 
 function headersToObject(list) {
