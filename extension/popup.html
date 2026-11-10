@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Send to TV</h1>
+    <span id="conn" class="pill">…</span>
+  </header>
+
+  <section id="now" hidden>
+    <div class="label">On the TV</div>
+    <div id="nowTitle" class="title"></div>
+    <div class="progress">
+      <span id="pos">0:00</span>
+      <input id="seek" type="range" min="0" max="100" value="0" step="1">
+      <span id="dur">--:--</span>
+    </div>
+    <div class="controls">
+      <button id="back30" title="Back 30s">−30</button>
+      <button id="back10" title="Back 10s">−10</button>
+      <button id="playpause" class="primary" title="Play / pause">⏯</button>
+      <button id="fwd10" title="Forward 10s">+10</button>
+      <button id="fwd30" title="Forward 30s">+30</button>
+      <button id="stop" title="Stop">■</button>
+    </div>
+    <div class="vol">
+      <span>🔈</span><input id="volume" type="range" min="0" max="100" value="10"><span id="volNum"></span>
+    </div>
+    <div id="nowSubs" class="hint"></div>
+  </section>
+
+  <section>
+    <div class="label">Videos found on this page</div>
+    <div id="list"></div>
+    <div id="empty" class="hint" hidden>
+      Nothing detected yet. Press play on the video in the page, then reopen this.
+    </div>
+  </section>
+
+  <section>
+    <div class="label">Subtitles</div>
+    <select id="subs"><option value="auto">Automatic (from the stream)</option><option value="">Off</option></select>
+  </section>
+
+  <section class="row">
+    <button id="tryPage" title="Let yt-dlp look at the page address">Try the page link instead</button>
+    <button id="refresh" title="Clear and reload the page to detect again">Reload &amp; detect</button>
+  </section>
+
+  <div id="msg" class="msg" hidden></div>
+  <script src="popup.js"></script>
+</body>
+</html>
