@@ -1,5 +1,5 @@
 // Tests for the extension's stream detection (background.js).
-// Run from the repository root:  node --test tests/
+// Run from the repository root:  node --test tests/classify.test.mjs
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";

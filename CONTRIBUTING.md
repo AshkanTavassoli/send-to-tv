@@ -31,7 +31,7 @@ You can also run the helper directly, without launchd: `python3 helper/tvcast.py
 
 ```bash
 python3 -m unittest discover -s tests -v   # helper
-node --test tests/                         # extension
+node --test tests/classify.test.mjs                         # extension
 ruff check .                               # lint (pip install ruff)
 shellcheck install.sh uninstall.sh
 ```

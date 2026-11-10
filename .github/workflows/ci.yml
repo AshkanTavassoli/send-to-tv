@@ -35,7 +35,7 @@ jobs:
         run: for f in extension/*.js; do node --check "$f"; done
       - name: Manifest is valid JSON
         run: node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json', 'utf8'))"
-      - run: node --test tests/
+      - run: node --test tests/classify.test.mjs
 
   lint:
     name: Lint

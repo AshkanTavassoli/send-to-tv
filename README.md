@@ -137,7 +137,7 @@ Then remove the extension in `chrome://extensions`.
 
 ```bash
 python3 -m unittest discover -s tests -v   # helper tests
-node --test tests/                         # extension tests
+node --test tests/classify.test.mjs                         # extension tests
 ruff check .                               # lint
 ```
 
