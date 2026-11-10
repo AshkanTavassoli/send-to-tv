@@ -1,4 +1,8 @@
-# Send to TV
+<p align="center"><img src="extension/icon.svg" width="128" alt="Send to TV icon: an old TV with glasses, a mustache and a party hat"></p>
+
+<h1 align="center">Send to TV</h1>
+
+<p align="center"><em>Teach your old TV new tricks.</em></p>
 
 **Play the video from any web page on your TV — at full quality, with subtitles — from Chrome on your Mac.**
 
